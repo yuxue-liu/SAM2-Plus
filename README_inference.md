@@ -79,8 +79,6 @@ error — use `--save-video` instead).
 | `tools/infer_ts_stereo_keypoints.py` | inference interface (loads TorchScript) |
 | `tools/needle_keypoints.py` | geometric keypoint + pose computation |
 | `tools/needle_calib.json` | stereo calibration |
-| `docs/METHOD_keypoints.html` | method description |
-| `docs/USAGE_keypoints.html` | usage (Chinese) |
 
 ## Citation
 

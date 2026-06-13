@@ -4,3 +4,9 @@
 *.mp4
 weights/
 
+
+*.pt
+*.ts.pt
+*.mp4
+weights/
+
