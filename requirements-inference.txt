@@ -1,0 +1,17 @@
+# Inference / pose-estimation dependencies (Python 3.10).
+# PyTorch is installed separately (CUDA-specific), see docs/README.md:
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+
+numpy
+pillow
+opencv-python
+pyyaml>=5.4.0
+einops
+scipy            # 3D circle / fixed-radius registration (least_squares, cKDTree)
+scikit-image     # needle centerline skeletonization
+easydict
+
+# --- optional ---
+# torch-tensorrt        # TensorRT FP16 engine export/inference (--seg-engine); auto-falls back to TorchScript if absent
+# tensorboard           # only for training
+# scikit-learn          # only for some training/eval extras

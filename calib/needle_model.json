@@ -1,0 +1,10 @@
+{
+  "radius_mm": 6.616285244843839,
+  "radius_mean_trimmed_mm": 6.616285244843839,
+  "radius_std_mm": 0.0,
+  "n_frames_used": 1,
+  "n_sidecars_scanned": 227,
+  "min_conf": 0.5,
+  "units": "mm",
+  "note": "Canonical needle arc radius for fixed-radius 3D registration (see docs/NEEDLE_POSE_REGISTRATION.md). Loaded via --needle-model."
+}

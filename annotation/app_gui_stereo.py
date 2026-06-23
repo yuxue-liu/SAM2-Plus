@@ -1,0 +1,1077 @@
+"""
+SAM-2-Plus multi-class interactive video annotator.
+
+Annotates ONE part-folder (<=200 frames) of the extracted dataset.
+Each class is a SAM object (obj_id 1..N); background = 0. Masks are auto-saved
+as single-channel index PNGs mirrored into masks/ (UniMatch-V2 convention).
+
+Features
+  * Point mode  : left-click = positive, right-click (or Ctrl+left) = negative
+                  -> real-time SAM selection for the active class on this frame
+  * Brush mode  : drag with left/right button to lay many positive/negative
+                  points along the stroke, SAM runs on release
+  * Multi-class : pick the active class (1..N); each gets its own SAM object
+  * Propagate   : forward video tracking from the current frame
+  * Pause/Resume: pause anytime, edit frames, resume -> re-propagates from the
+                  current frame using the latest corrections
+  * Rewind/seek : -10 / -1 / +1 / +10 and a slider to revisit & fix any frame
+  * Auto-save   : every edited or propagated frame is written immediately
+
+Run (inside your SAM-2 env, with the checkpoint present):
+  cd demo
+  python app_gui.py --image_dir D:/study/code/ab_dataset/images/a/part_000 \
+                    --num-classes 3
+"""
+import os
+# must be set BEFORE torch initializes CUDA -> reduces fragmentation OOM
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import cv2
+import torch
+import argparse
+import tkinter as tk
+from tkinter import ttk, simpledialog, messagebox
+import json
+import numpy as np
+from PIL import Image, ImageTk
+import warnings
+import json
+from pathlib import Path
+
+from natsort import natsorted
+
+# make the SAM2-Plus repo root importable regardless of the launch cwd
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from sam2_plus.build_sam import build_sam2_video_predictor_plus
+from point_manager import PointManager
+from app_core import AnnotationSession
+from engine import overlay_index_mask, PALETTE
+
+import numpy as np
+# needle centerline extraction (skeletonize -> ordered polyline / robust arc fit)
+try:
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tools")))
+    from needle_keypoints import order_skeleton, fit_arc_2d, process_frame, load_calib
+except Exception as _cl_err:                       # skimage/scipy missing -> centerline off
+    order_skeleton = fit_arc_2d = process_frame = load_calib = None
+    print(f"[warn] centerline/stereo disabled: {_cl_err}")
+
+
+# ----------------------------------------------------------------- UI theme
+_PANEL_BG = "#eef1f4"
+_FONT = ("TkDefaultFont", 10, "bold")
+_BTN = {  # kind -> (bg, fg, active-bg)
+    "primary": ("#2e7d57", "#ffffff", "#24613f"),
+    "action":  ("#3270b3", "#ffffff", "#255a91"),
+    "danger":  ("#b3433b", "#ffffff", "#8f332c"),
+    "neutral": ("#566573", "#ffffff", "#3f4a55"),
+}
+
+
+def mkbtn(parent, text, cmd, kind="action", **kw):
+    bg, fg, ab = _BTN[kind]
+    return tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
+                     activebackground=ab, activeforeground="#ffffff",
+                     relief="flat", bd=0, padx=10, pady=4, font=_FONT,
+                     cursor="hand2", highlightthickness=0, **kw)
+
+
+def mklf(parent, text):
+    return tk.LabelFrame(parent, text=text, font=("TkDefaultFont", 9, "bold"),
+                         fg="#2c3e50", bg=_PANEL_BG, padx=5, pady=3)
+
+
+def _derive_ds_key(image_dir):
+    """From .../<ds>/images/<key>/part_xxx -> (ds_root, key)."""
+    p = os.path.abspath(image_dir).replace("\\", "/").split("/")
+    if "images" in p:
+        i = p.index("images")
+        if i >= 1 and i + 1 < len(p):
+            return "/".join(p[:i]), p[i + 1]
+    return None, None
+
+
+def _extend_to_mask(poly, mask):
+    """Extend both ends of the centerline outward (along the end tangent) to the
+    farthest needle-mask pixel, so the line reaches the true tip/tail."""
+    poly = np.asarray(poly, float)
+    if len(poly) < 2:
+        return poly
+    H, W = mask.shape
+
+    def walk(p_in, p_end):
+        d = p_end - p_in
+        nrm = np.linalg.norm(d)
+        if nrm < 1e-6:
+            return p_end
+        d = d / nrm
+        cur, last = p_end.copy(), p_end.copy()
+        for _ in range(400):
+            cur = cur + d
+            xi, yi = int(round(cur[0])), int(round(cur[1]))
+            if 0 <= xi < W and 0 <= yi < H and mask[yi, xi]:
+                last = cur.copy()
+            else:
+                break
+        return last
+
+    return np.vstack([walk(poly[1], poly[0]), poly, walk(poly[-2], poly[-1])])
+
+warnings.filterwarnings("ignore", message="cannot import name '_C' from 'sam2'")
+os.environ["TQDM_DISABLE"] = "1"
+
+# ---------------- ARGUMENTS ----------------
+parser = argparse.ArgumentParser()
+parser.add_argument("--root", default="/root/autodl-tmp/data/surgical_seg",
+                    help="dataset root, used with --dataset/--key when --image_dir is omitted")
+parser.add_argument("--dataset", default=None, help="video name under --root (e.g. march_1)")
+parser.add_argument("--key", default=None, help="left-eye frame key (e.g. 1_01); = images/<key>")
+parser.add_argument("--image_dir", default=None, type=str,
+                    help="a single part-folder, e.g. .../images/a/part_000")
+parser.add_argument("--num-classes", type=int, default=3)
+parser.add_argument("--part-index", type=int, default=0,
+                    help="which part folder to start on (0-based); use the Part ◀ ▶ buttons to switch")
+parser.add_argument("--cfg", type=str,
+                    default="configs/sam2.1/sam2.1_hiera_b+_predmasks_decoupled_MAME.yaml",
+                    help="hydra model config (package-relative)")
+parser.add_argument("--ckpt", type=str, default=None,
+                    help="checkpoint path; default: <SAM2-Plus>/checkpoints/checkpoint_phase123.pt")
+parser.add_argument("--max-disp", type=int, default=1100,
+                    help="max canvas width in px (height scales to keep aspect)")
+# frames are kept on CPU by default (200 frames on GPU is what OOMs cuDNN);
+# pass --gpu-video only on a large, dedicated GPU for a small speed gain.
+parser.add_argument("--gpu-video", dest="offload_video", action="store_false",
+                    help="keep video frames on GPU (default: offload to CPU)")
+parser.add_argument("--offload-state", action="store_true",
+                    help="also offload inference state to CPU (slower, least VRAM)")
+parser.add_argument("--kp-subdir", default="keypoints_pred",
+                    help="sidecar dir for needle keypoints (Keypt mode loads/saves here)")
+parser.add_argument("--needle-class", type=int, default=1,
+                    help="obj_id of the needle (its mask drives the live centerline)")
+parser.add_argument("--num-keypoints", type=int, default=5,
+                    help="number of keypoints sampled along the centerline (tip..tail)")
+parser.add_argument("--thread-class", type=int, default=2, help="obj_id of the suture thread")
+parser.add_argument("--calib", default="../tools/needle_calib.json",
+                    help="stereo calibration json (for the Sync button)")
+parser.set_defaults(offload_video=True)
+args = parser.parse_args()
+if not args.image_dir:
+    assert args.dataset and args.key, \
+        "give --image_dir, or both --dataset and --key (joined with --root)"
+    args.image_dir = os.path.join(args.root, args.dataset, "images", args.key)
+
+MODEL_CFG = args.cfg
+MODEL_CKPT = args.ckpt or os.path.join(
+    os.path.dirname(__file__), "..", "checkpoints", "checkpoint_phase123.pt")
+
+# ---------------- DISCOVER PART FOLDERS ----------------
+# --image_dir may be a single part folder (has images) OR a video folder whose
+# children are part_000/part_001/... . In the latter case we list all parts and
+# let the GUI switch between them (the SAM2 predictor is reused, no model reload).
+def _has_images(d):
+    return any(f.lower().endswith((".jpg", ".jpeg", ".png")) for f in os.listdir(d))
+
+def discover_parts(image_dir):
+    if _has_images(image_dir):
+        return [image_dir]
+    subs = sorted(os.path.join(image_dir, d) for d in os.listdir(image_dir)
+                  if os.path.isdir(os.path.join(image_dir, d)))
+    parts = [s for s in subs if _has_images(s)]
+    return parts or [image_dir]
+
+PARTS = discover_parts(args.image_dir)
+assert PARTS, f"No images / part folders under {args.image_dir}"
+print(f"[parts] {len(PARTS)} part(s): {[os.path.basename(p) for p in PARTS]}")
+
+# ---------------- LOAD MODEL (once, reused across parts) ----------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+predictor = build_sam2_video_predictor_plus(MODEL_CFG, MODEL_CKPT, device=device)
+# Treat a correction on ANY frame (incl. already-propagated ones) as a
+# conditioning frame, so edits after rewinding take full effect immediately
+# AND survive a later re-propagation. Without this, corrections on tracked
+# frames are stored as non-conditioning tweaks that barely move the mask.
+predictor.add_all_frames_to_correct_as_cond = True
+print("[OK] SAM-2-Plus loaded on", device)
+
+
+# ====================================================================
+# GUI
+# ====================================================================
+class AnnotatorGUI:
+    def __init__(self, root):
+        self.root = root
+        self.parts = PARTS
+        self.part_idx = min(max(getattr(args, "part_index", 0), 0), len(PARTS) - 1)
+        self.cur = 0                       # current frame index
+        self.active_cls = 1                # active class (obj_id)
+        self.mode = "point"               # "point" | "brush"
+        self.propagating = False
+        self._load_part(self.part_idx)     # builds self.sess for the current part
+        self._init_curation()             # excluded-frames + augmentation specs
+        self.brush_spacing = 12            # px between sampled brush points (native)
+        self.propagating = False
+        self.gen = None
+        self._brush_last = None            # last sampled brush point (native coords)
+        self._stroke_active = False         # paint-mode stroke in progress
+
+        # ---- display / zoom-pan state ----
+        # Everything (mask + points) is rendered at NATIVE resolution, then a
+        # viewport is cropped (zoom + offset) and resized to the fixed canvas.
+        self.nW, self.nH = self.sess.W, self.sess.H
+        # fill the screen: fit the native frame into (screen_w, screen_h - controls),
+        # allowing upscale (no 1.0 cap) so the workspace uses the whole display
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        # left eye fills the LEFT half of the screen (right half = right-eye window)
+        self.base_scale = min((sw / 2 - 20) / self.nW, max(1.0, (sh - 260)) / self.nH)
+        self.dW = int(self.nW * self.base_scale)
+        self.dH = int(self.nH * self.base_scale)
+        self.centerline = {}               # frame idx -> (mask-sum signature, polyline)
+        self.zoom = 1.0                    # >=1.0; 1.0 = whole frame fits canvas
+        self.min_zoom, self.max_zoom = 1.0, 8.0
+        self.off_x, self.off_y = 0.0, 0.0  # native coord of top-left visible pixel
+        self._pan_last = None              # last middle-drag pos (canvas coords)
+        self.tk_img = None
+
+        # ---- stereo right-eye window + calibration (for the Sync button) ----
+        self.ds_root, self.key = _derive_ds_key(args.image_dir)
+        self.calib = None
+        if load_calib is not None and args.calib and os.path.exists(args.calib):
+            try:
+                self.calib = load_calib(args.calib)
+            except Exception as _e:
+                print(f"[warn] calib load failed: {_e}")
+        self.rW = max(400, root.winfo_screenwidth() // 2 - 20)
+        self.rtk = None
+        self.rcanvas = None        # right-eye canvas, created in _build_ui beside the left one
+
+        root.title("SAM-2-Plus Annotator (stereo: left | right)")
+        _sw, _sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{_sw}x{_sh}+0+0")                # single full-screen window
+        self._build_ui()
+        self.redraw()
+        self.render_right()
+
+    # ------------------------------------------------------------ part switching
+    def _load_part(self, idx):
+        """(Re)build the SAM2 state + session for part `idx`, reusing the model."""
+        idx = max(0, min(idx, len(self.parts) - 1))
+        self.part_idx = idx
+        part_dir = self.parts[idx]
+        frames = [os.path.join(part_dir, f) for f in natsorted(os.listdir(part_dir))
+                  if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+        # release previous SAM2 state before loading the next part
+        if getattr(self, "sess", None) is not None:
+            self.sess = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        state = predictor.init_state(part_dir,
+                                     offload_video_to_cpu=args.offload_video,
+                                     offload_state_to_cpu=args.offload_state)
+        self.sess = AnnotationSession(predictor, state, frames, args.num_classes, PointManager())
+        self.cur = 0
+        self.propagating = False
+        self.root.title(f"SAM-2-Plus Annotator  -  part {idx + 1}/{len(self.parts)}: "
+                        f"{os.path.basename(part_dir)}")
+        if hasattr(self, "slider"):
+            self.slider.config(to=max(0, self.sess.num_frames - 1))
+            self.slider.set(0)
+        if hasattr(self, "part_lbl"):
+            self.part_lbl.config(text=f"part {idx + 1}/{len(self.parts)}")
+        # keypoint-editing state is per-part (frames change) -> reset
+        self.kp_sel = None                 # index of selected keypoint on cur frame
+        self.kp_add = False                # next left-click adds a new keypoint
+        self.kp_cache = {}                 # frame idx -> keypoints list (refs into kp_full)
+        self.kp_full = {}                  # frame idx -> full sidecar dict
+        self.centerline = {}               # frame idx -> (mask-sum signature, polyline)
+        self.kp_flip = {}                  # frame idx -> bool (tip/tail manually flipped)
+        if hasattr(self, "canvas"):
+            self.redraw()
+
+    def _switch_part(self, delta):
+        if self.propagating:
+            return
+        self._load_part(self.part_idx + delta)
+
+    def done_next_part(self):
+        """Mark current part done and advance; notify when all parts are finished.
+        (Masks auto-save on every edit/propagation, so no extra save is needed.)"""
+        if self.propagating:
+            return
+        if self.part_idx < len(self.parts) - 1:
+            self._load_part(self.part_idx + 1)
+            messagebox.showinfo("Next part",
+                                f"Now on part {self.part_idx + 1}/{len(self.parts)}: "
+                                f"{os.path.basename(self.parts[self.part_idx])}")
+        else:
+            messagebox.showinfo(
+                "All parts done",
+                "All parts of this video are annotated.\n\n"
+                "Close this window, then run:\n"
+                "bash tools/build_one_dataset.sh finalize <name> <right_mp4> <key>")
+
+    # ------------------------------------------------------------ UI layout
+    def _build_ui(self):
+        # both eyes side-by-side in ONE window: [left canvas | right canvas]
+        top = tk.Frame(self.root, bg=_PANEL_BG)
+        top.grid(row=0, column=0, columnspan=12, padx=6, pady=6)
+        tk.Label(top, text="LEFT (editable)", bg=_PANEL_BG, font=_FONT,
+                 fg="#2e7d57").grid(row=0, column=0, sticky="w")
+        tk.Label(top, text="RIGHT (sync target)", bg=_PANEL_BG, font=_FONT,
+                 fg="#3270b3").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.canvas = tk.Canvas(top, width=self.dW, height=self.dH, bg="black")
+        self.canvas.grid(row=1, column=0)
+        self.rcanvas = tk.Canvas(top, width=self.rW, height=self.dH, bg="black")
+        self.rcanvas.grid(row=1, column=1, padx=(8, 0))
+        self.canvas.bind("<Button-1>", self.on_left_down)
+        self.canvas.bind("<Button-3>", self.on_right_down)
+        self.canvas.bind("<Control-Button-1>", self.on_right_down)
+        self.canvas.bind("<B1-Motion>", lambda e: self.on_drag(e, 1))
+        self.canvas.bind("<B3-Motion>", lambda e: self.on_drag(e, 0))
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<ButtonRelease-3>", self.on_release)
+        # zoom: mouse wheel (Windows/mac) + Button-4/5 (Linux/X11, e.g. autodl)
+        self.canvas.bind("<MouseWheel>", self.on_wheel)
+        self.canvas.bind("<Button-4>", lambda e: self.on_wheel(e, delta=1))
+        self.canvas.bind("<Button-5>", lambda e: self.on_wheel(e, delta=-1))
+        # pan: middle-button drag
+        self.canvas.bind("<Button-2>", self.on_pan_start)
+        self.canvas.bind("<B2-Motion>", self.on_pan_move)
+        self.canvas.bind("<ButtonRelease-2>", lambda e: setattr(self, "_pan_last", None))
+        # keypoint shortcuts: a = toggle Add, Delete = delete selected
+        self.root.bind("a", lambda e: self.kp_add_toggle())
+        self.root.bind("<Delete>", lambda e: self.kp_delete_sel())
+
+        self.root.configure(bg=_PANEL_BG)
+        _names = {1: "needle", 2: "thread", 3: "clamps"}
+        # ---- STEP 1: pick the object (class) ----
+        cls_frame = mklf(self.root, "1 · Object")
+        cls_frame.grid(row=1, column=0, columnspan=4, sticky="w", padx=6, pady=2)
+        self.cls_var = tk.IntVar(value=1)
+        for c in range(1, args.num_classes + 1):
+            r, g, b = PALETTE.get(c, (200, 200, 200))[::-1]  # BGR->RGB
+            col = f"#{r:02x}{g:02x}{b:02x}"
+            tk.Radiobutton(cls_frame, text=f"{c} {_names.get(c, '')}".strip(),
+                           variable=self.cls_var, value=c, indicatoron=False,
+                           width=9, font=_FONT, fg=col, bg="#ffffff",
+                           selectcolor="#cfe0f0", relief="groove", bd=2,
+                           command=self.on_class_change).pack(side="left", padx=2)
+
+        # ---- STEP 2: what you edit — MASK tools vs POINTS (never interfere) ----
+        mode_frame = mklf(self.root, "2 · Edit")
+        mode_frame.grid(row=1, column=4, columnspan=3, sticky="w", pady=2)
+        self.mode_var = tk.StringVar(value="point")
+        tk.Label(mode_frame, text="mask:", bg=_PANEL_BG, font=_FONT, fg="#b3433b").pack(side="left")
+        for _val, _lab in (("point", "Point"), ("brush", "Brush"), ("paint", "Paint")):
+            tk.Radiobutton(mode_frame, text=_lab, variable=self.mode_var, value=_val,
+                           indicatoron=False, width=5, font=_FONT, bg="#ffffff",
+                           selectcolor="#f0d2cf", relief="groove", bd=2,
+                           command=self.on_mode_change).pack(side="left", padx=1)
+        tk.Label(mode_frame, text="points:", bg=_PANEL_BG, font=_FONT, fg="#3270b3").pack(side="left", padx=(8, 0))
+        tk.Radiobutton(mode_frame, text="Keypt", variable=self.mode_var, value="keypt",
+                       indicatoron=False, width=6, font=_FONT, bg="#ffffff",
+                       selectcolor="#cfe0f0", relief="groove", bd=2,
+                       command=self.on_mode_change).pack(side="left", padx=1)
+        tk.Label(mode_frame, text="brush", bg=_PANEL_BG).pack(side="left", padx=(8, 0))
+        self.brush_scale = tk.Scale(mode_frame, from_=4, to=40, orient="horizontal",
+                                    length=90, showvalue=True, bg=_PANEL_BG,
+                                    command=self.on_brush_size)
+        self.brush_scale.set(self.brush_spacing)
+        self.brush_scale.pack(side="left")
+
+        # ---- frame navigation ----
+        nav = mklf(self.root, "Frame")
+        nav.grid(row=1, column=7, columnspan=5, sticky="we", pady=2)
+        mkbtn(nav, "⏮10", lambda: self.seek(self.cur - 10)).pack(side="left", padx=1)
+        mkbtn(nav, "◀1", lambda: self.seek(self.cur - 1)).pack(side="left", padx=1)
+        mkbtn(nav, "1▶", lambda: self.seek(self.cur + 1)).pack(side="left", padx=1)
+        mkbtn(nav, "10⏭", lambda: self.seek(self.cur + 10)).pack(side="left", padx=1)
+        self.slider = tk.Scale(nav, from_=0, to=self.sess.num_frames - 1,
+                               orient="horizontal", length=220, bg=_PANEL_BG,
+                               command=self.on_slider, showvalue=False)
+        self.slider.pack(side="left", padx=4)
+
+        # ---- STEP 3: act on the current selection ----
+        act = tk.Frame(self.root, bg=_PANEL_BG)
+        act.grid(row=2, column=0, columnspan=12, sticky="we", pady=4)
+
+        mask_f = mklf(act, "Mask"); mask_f.pack(side="left", padx=6)
+        mkbtn(mask_f, "Clear class", self.clear_class, "danger").pack(side="left", padx=2)
+        mkbtn(mask_f, "Clear all", self.clear_frame, "danger").pack(side="left", padx=2)
+        mkbtn(mask_f, "Use saved", self.use_saved_mask, "neutral").pack(side="left", padx=2)
+        self.prop_btn = mkbtn(mask_f, "Propagate ▶", self.toggle_propagate, "primary", width=12)
+        self.prop_btn.pack(side="left", padx=4)
+        mkbtn(mask_f, "Reset part", self.reset_all, "danger").pack(side="left", padx=2)
+
+        kp_frame = mklf(act, "Keypoints"); kp_frame.pack(side="left", padx=6)
+        mkbtn(kp_frame, "Add (a)", self.kp_add_toggle, "action").pack(side="left", padx=2)
+        mkbtn(kp_frame, "Del (Del)", self.kp_delete_sel, "danger").pack(side="left", padx=2)
+        mkbtn(kp_frame, "Tip↔Tail", self.kp_swap_tip_tail, "neutral").pack(side="left", padx=2)
+        mkbtn(kp_frame, "Sync ▶R", self.sync_other_eye, "primary").pack(side="left", padx=4)
+
+        part_frame = mklf(act, "Part"); part_frame.pack(side="left", padx=6)
+        mkbtn(part_frame, "◀", lambda: self._switch_part(-1)).pack(side="left", padx=1)
+        self.part_lbl = tk.Label(part_frame, text=f"{self.part_idx + 1}/{len(self.parts)}",
+                                 width=6, bg="#ffffff", relief="groove", font=_FONT)
+        self.part_lbl.pack(side="left", padx=2)
+        mkbtn(part_frame, "▶", lambda: self._switch_part(1)).pack(side="left", padx=1)
+        mkbtn(part_frame, "Done ✓", self.done_next_part, "primary").pack(side="left", padx=4)
+
+        cur_frame = mklf(act, "Curate"); cur_frame.pack(side="left", padx=6)
+        mkbtn(cur_frame, "Del range", self.delete_range, "danger").pack(side="left", padx=2)
+        mkbtn(cur_frame, "Restore", self.restore_range, "neutral").pack(side="left", padx=2)
+        mkbtn(cur_frame, "Augment", self.augment_settings, "neutral").pack(side="left", padx=2)
+
+        zoom_frame = mklf(act, "Zoom"); zoom_frame.pack(side="left", padx=6)
+        mkbtn(zoom_frame, "−", lambda: self.zoom_at(1 / 1.25, self.dW / 2, self.dH / 2), "neutral", width=2).pack(side="left", padx=1)
+        mkbtn(zoom_frame, "+", lambda: self.zoom_at(1.25, self.dW / 2, self.dH / 2), "neutral", width=2).pack(side="left", padx=1)
+        mkbtn(zoom_frame, "Fit", self.zoom_fit, "neutral").pack(side="left", padx=2)
+        self.zoom_lbl = tk.Label(zoom_frame, text="100%", width=5, bg="#ffffff",
+                                 relief="groove", font=_FONT)
+        self.zoom_lbl.pack(side="left", padx=2)
+
+        self.status = tk.Label(self.root, text="", anchor="w", fg="#1a3c5a",
+                               bg="#dbe5ee", font=_FONT, padx=8, pady=3)
+        self.status.grid(row=3, column=0, columnspan=12, sticky="we", padx=6, pady=(2, 4))
+
+    # ----------------------------------------------------- coord mapping
+    def _eff(self):
+        """Effective px-per-native-px at the current zoom."""
+        return self.base_scale * self.zoom
+
+    def _clamp_offsets(self):
+        eff = self._eff()
+        view_w, view_h = self.dW / eff, self.dH / eff
+        self.off_x = min(max(self.off_x, 0.0), max(0.0, self.nW - view_w))
+        self.off_y = min(max(self.off_y, 0.0), max(0.0, self.nH - view_h))
+
+    def to_native(self, ex, ey):
+        """Canvas pixel -> native image pixel (accounts for zoom + pan)."""
+        eff = self._eff()
+        nx = self.off_x + min(max(ex, 0), self.dW - 1) / eff
+        ny = self.off_y + min(max(ey, 0), self.dH - 1) / eff
+        return int(min(max(nx, 0), self.nW - 1)), int(min(max(ny, 0), self.nH - 1))
+
+    # ----------------------------------------------------- zoom / pan
+    def zoom_at(self, factor, cx, cy):
+        """Zoom by `factor`, keeping the native point under (cx,cy) fixed."""
+        eff_old = self._eff()
+        nx = self.off_x + cx / eff_old
+        ny = self.off_y + cy / eff_old
+        self.zoom = min(max(self.zoom * factor, self.min_zoom), self.max_zoom)
+        eff_new = self._eff()
+        self.off_x = nx - cx / eff_new
+        self.off_y = ny - cy / eff_new
+        self._clamp_offsets()
+        self.redraw()
+
+    def zoom_fit(self):
+        self.zoom = 1.0
+        self.off_x = self.off_y = 0.0
+        self.redraw()
+
+    def on_wheel(self, e, delta=None):
+        if delta is None:
+            delta = 1 if getattr(e, "delta", 0) > 0 else -1
+        self.zoom_at(1.25 if delta > 0 else 1 / 1.25, e.x, e.y)
+
+    def on_pan_start(self, e):
+        self._pan_last = (e.x, e.y)
+
+    def on_pan_move(self, e):
+        if self._pan_last is None:
+            return
+        eff = self._eff()
+        self.off_x -= (e.x - self._pan_last[0]) / eff
+        self.off_y -= (e.y - self._pan_last[1]) / eff
+        self._pan_last = (e.x, e.y)
+        self._clamp_offsets()
+        self.redraw()
+
+    def on_brush_size(self, v):
+        self.brush_spacing = max(1, int(float(v)))
+
+    # ----------------------------------------------------- drawing
+    def redraw(self):
+        img = cv2.imread(self.sess.frames[self.cur])          # native nH x nW
+        idx = self.sess.get_mask(self.cur)
+        img = overlay_index_mask(img, idx)   # low-saturation, semi-transparent
+        # draw active-class points on this frame (at native coords)
+        pts, labels = self.sess.pm.get(self.cur, self.active_cls)
+        for (x, y), lb in zip(pts, labels):
+            color = (0, 255, 0) if lb == 1 else (0, 0, 255)
+            cv2.circle(img, (int(x), int(y)), 5, color, -1)
+            cv2.circle(img, (int(x), int(y)), 5, (255, 255, 255), 1)
+        # needle centerline auto-derived from the (edited) mask (magenta line)
+        poly = self._needle_centerline(self.cur)
+        if poly is not None and len(poly) >= 2:
+            cv2.polylines(img, [np.asarray(poly, np.int32).reshape(-1, 1, 2)],
+                          False, (255, 0, 255), 2, cv2.LINE_AA)
+        # draw needle keypoints (Keypt mode loads/edits these); selected = cyan
+        for j, kp in enumerate(self.load_kps(self.cur)):
+            if kp.get("x") is None:
+                continue
+            kx, ky = int(kp["x"]), int(kp["y"])
+            sel = (self.mode == "keypt" and j == self.kp_sel)
+            col = (0, 255, 255) if sel else (0, 165, 255)
+            cv2.circle(img, (kx, ky), 6, col, -1)
+            cv2.circle(img, (kx, ky), 6, (255, 255, 255), 1)
+            cv2.putText(img, str(kp.get("name", j)), (kx + 7, ky - 7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+        # crop the zoom/pan viewport, then scale to the fixed canvas
+        eff = self._eff()
+        self._clamp_offsets()
+        x0, y0 = int(round(self.off_x)), int(round(self.off_y))
+        x1 = min(self.nW, int(round(x0 + self.dW / eff)))
+        y1 = min(self.nH, int(round(y0 + self.dH / eff)))
+        crop = img[y0:y1, x0:x1]
+        disp = cv2.resize(crop, (self.dW, self.dH), interpolation=cv2.INTER_LINEAR)
+        disp = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+        self.tk_img = ImageTk.PhotoImage(Image.fromarray(disp))
+        self.canvas.delete("frame_img")
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_img,
+                                 tags="frame_img")
+        self._set_status()
+        if hasattr(self, "zoom_lbl"):
+            self.zoom_lbl.config(text=f"{int(self.zoom * 100)}%")
+        self.canvas.update_idletasks()   # force immediate repaint within handlers
+
+    def _set_status(self):
+        objs = self.sess.pm.objs_on_frame(self.cur)
+        saved = "saved" if os.path.exists(self.sess.mask_path(self.cur)) else "-"
+        excl = "  [EXCLUDED]" if self.sess.frames[self.cur] in self.excluded else ""
+        self.status.config(
+            fg="red" if excl else "navy",
+            text=f"frame {self.cur+1}/{self.sess.num_frames}  |  "
+                 f"class={self.active_cls}  mode={self.mode}  |  "
+                 f"prompts on frame: {objs}  |  mask:{saved}  |  "
+                 f"excluded={len(self.excluded)} augspecs={len(self.augment_specs)}  |  "
+                 f"{'PROPAGATING...' if self.propagating else 'idle'}{excl}")
+
+    # ---------------------------------------- curation: delete-range / augment
+    def _init_curation(self):
+        p = os.path.abspath(self.sess.frames[0]).replace("\\", "/")
+        self.droot = p.split("/images/")[0] if "/images/" in p else os.path.dirname(p)
+        self.excluded = set()
+        self.augment_specs = []
+        exc, aug = self._curation_paths()
+        if os.path.exists(exc):
+            for line in open(exc, encoding="utf-8"):
+                line = line.strip()
+                if line:
+                    self.excluded.add(line)
+        if os.path.exists(aug):
+            try:
+                self.augment_specs = json.load(open(aug, encoding="utf-8"))
+            except Exception:
+                self.augment_specs = []
+
+    def _curation_paths(self):
+        return (os.path.join(self.droot, "excluded_frames.txt"),
+                os.path.join(self.droot, "augment_config.json"))
+
+    def _save_curation(self):
+        exc, aug = self._curation_paths()
+        with open(exc, "w", encoding="utf-8") as f:
+            f.write("\n".join(sorted(self.excluded)) + ("\n" if self.excluded else ""))
+        with open(aug, "w", encoding="utf-8") as f:
+            json.dump(self.augment_specs, f, indent=2)
+
+    def _ask_range(self, title, extra_hint=""):
+        s = simpledialog.askstring(
+            title, f"frames: start end {extra_hint}\n"
+                   f"(1..{self.sess.num_frames}; current = {self.cur + 1})", parent=self.root)
+        if not s:
+            return None
+        parts = s.replace(",", " ").split()
+        if len(parts) < 2:
+            messagebox.showwarning(title, "need at least: start end")
+            return None
+        try:
+            a, b = int(parts[0]), int(parts[1])
+        except ValueError:
+            messagebox.showwarning(title, "start/end must be integers")
+            return None
+        n = self.sess.num_frames
+        a = max(1, min(a, n)); b = max(1, min(b, n))
+        if a > b:
+            a, b = b, a
+        return a - 1, b - 1, parts[2:]
+
+    def delete_range(self):
+        r = self._ask_range("Delete frames")
+        if not r:
+            return
+        a, b, _ = r
+        for i in range(a, b + 1):
+            self.excluded.add(self.sess.frames[i])
+        self._save_curation(); self.redraw()
+        messagebox.showinfo("Delete", f"excluded {b - a + 1} frames "
+                            f"({a + 1}..{b + 1}); total excluded = {len(self.excluded)}")
+
+    def restore_range(self):
+        r = self._ask_range("Restore frames")
+        if not r:
+            return
+        a, b, _ = r
+        for i in range(a, b + 1):
+            self.excluded.discard(self.sess.frames[i])
+        self._save_curation(); self.redraw()
+
+    def augment_settings(self):
+        r = self._ask_range("Augment frames", extra_hint="[rotate_deg translate_frac]")
+        if not r:
+            return
+        a, b, extra = r
+        angle = float(extra[0]) if len(extra) > 0 else 10.0
+        shift = float(extra[1]) if len(extra) > 1 else 0.05
+        self.augment_specs.append({
+            "frames": [self.sess.frames[i] for i in range(a, b + 1)],
+            "rotate_deg": angle, "translate_frac": shift, "hflip": True})
+        self._save_curation(); self.redraw()
+        messagebox.showinfo("Augment", f"spec for frames {a + 1}..{b + 1}: "
+                            f"rotate +/-{angle}, translate +/-{shift}; "
+                            f"total specs = {len(self.augment_specs)}")
+
+    # ----------------------------------------------------- events: selectors
+    def on_class_change(self):
+        self.active_cls = self.cls_var.get()
+        self.redraw()
+
+    def on_mode_change(self):
+        self.mode = self.mode_var.get()
+        self.redraw()
+
+    def on_slider(self, v):
+        if not self.propagating:
+            self.seek(int(v))
+
+    def seek(self, idx):
+        idx = max(0, min(self.sess.num_frames - 1, idx))
+        self.cur = idx
+        self.kp_sel = None
+        self.slider.set(idx)
+        self.redraw()
+        self.render_right()
+
+    # ----------------------------------------------------- events: mouse
+    def _add_and_apply(self, ex, ey, label):
+        x, y = self.to_native(ex, ey)
+        self.sess.pm.add_point(self.cur, self.active_cls, x, y, label)
+        self.sess.apply_points(self.cur, self.active_cls)
+        self.redraw()
+
+    def _down(self, e, label):
+        if self.propagating:
+            return
+        if self.mode == "keypt":
+            self._kp_down(e, label)
+            return
+        if self.mode == "point":
+            self._add_and_apply(e.x, e.y, label)
+        elif self.mode == "brush":
+            self._brush_last = self.to_native(e.x, e.y)
+            self.sess.pm.add_point(self.cur, self.active_cls, *self._brush_last, label)
+            self.redraw()
+        else:  # paint: directly write pixels, bypassing SAM
+            self._stroke_active = True
+            x, y = self.to_native(e.x, e.y)
+            self.sess.paint(self.cur, self.active_cls, x, y,
+                            self.brush_spacing, erase=(label == 0))
+            self.redraw()
+
+    def on_left_down(self, e):
+        self._down(e, 1)
+
+    def on_right_down(self, e):
+        self._down(e, 0)
+
+    def on_drag(self, e, label):
+        if self.propagating:
+            return
+        if self.mode == "keypt":
+            if self.kp_sel is not None:
+                kps = self.load_kps(self.cur)
+                if 0 <= self.kp_sel < len(kps):
+                    x, y = self.to_native(e.x, e.y)
+                    kps[self.kp_sel]["x"] = float(x)
+                    kps[self.kp_sel]["y"] = float(y)
+                    self.redraw()
+            return
+        if self.mode == "brush" and self._brush_last is not None:
+            x, y = self.to_native(e.x, e.y)
+            lx, ly = self._brush_last
+            if (x - lx) ** 2 + (y - ly) ** 2 >= self.brush_spacing ** 2:
+                self.sess.pm.add_point(self.cur, self.active_cls, x, y, label)
+                self._brush_last = (x, y)
+                self.redraw()        # live feedback (no SAM until release)
+        elif self.mode == "paint" and self._stroke_active:
+            x, y = self.to_native(e.x, e.y)
+            self.sess.paint(self.cur, self.active_cls, x, y,
+                            self.brush_spacing, erase=(label == 0))
+            self.redraw()
+
+    def on_release(self, e):
+        if self.propagating:
+            return
+        if self.mode == "keypt":
+            if self.kp_sel is not None:
+                self.save_kps(self.cur)
+            return
+        if self.mode == "brush" and self._brush_last is not None:
+            self._brush_last = None
+            self.sess.apply_points(self.cur, self.active_cls)   # run SAM once
+            self.redraw()
+        elif self.mode == "paint" and self._stroke_active:
+            self._stroke_active = False
+            self.sess.commit_paint(self.cur, self.active_cls)   # save + anchor SAM
+            self.redraw()
+
+    # ----------------------------------------------------- stereo right eye
+    def _right_paths(self):
+        """(right_image, right_mask_png) for the current frame, or (None, None)."""
+        if not (self.ds_root and self.key):
+            return None, None
+        stem = Path(self.sess.frames[self.cur]).stem
+        base = f"{self.ds_root}/stereo_right/{self.key}/{stem}"
+        return base + ".jpg", base + ".png"
+
+    def render_right(self):
+        """Display-only right-eye view: image + saved mask + keypoints (x_right)."""
+        if getattr(self, "rcanvas", None) is None or getattr(self, "sess", None) is None:
+            return
+        rimg, rmask = self._right_paths()
+        img = cv2.imread(rimg) if (rimg and os.path.exists(rimg)) else None
+        if img is None:
+            self.rcanvas.delete("all")
+            return
+        rneedle = None
+        if rmask and os.path.exists(rmask):
+            idx = cv2.imread(rmask, cv2.IMREAD_GRAYSCALE)
+            if idx is not None and idx.shape[:2] == img.shape[:2]:
+                img = overlay_index_mask(img, idx)
+                rneedle = (idx == args.needle_class)
+        # right-eye centerline (magenta) from the right needle mask
+        rpoly = self._centerline_of(rneedle) if rneedle is not None else None
+        if rpoly is not None and len(rpoly) >= 2:
+            cv2.polylines(img, [np.asarray(rpoly, np.int32).reshape(-1, 1, 2)],
+                          False, (255, 0, 255), 2, cv2.LINE_AA)
+        # keypoints: synced (x_right) if present, else sampled from the right line
+        drawn = False
+        for kp in self.load_kps(self.cur):
+            xr, yr = kp.get("x_right"), kp.get("y_right")
+            if xr is None or yr is None:
+                continue
+            cv2.circle(img, (int(xr), int(yr)), 6, (0, 165, 255), -1)
+            cv2.circle(img, (int(xr), int(yr)), 6, (255, 255, 255), 1)
+            drawn = True
+        if not drawn and rpoly is not None and len(rpoly) >= 2:
+            for p in self._resample(rpoly, args.num_keypoints):
+                cv2.circle(img, (int(p[0]), int(p[1])), 6, (0, 165, 255), -1)
+                cv2.circle(img, (int(p[0]), int(p[1])), 6, (255, 255, 255), 1)
+        s = self.rW / img.shape[1]
+        disp = cv2.cvtColor(cv2.resize(img, (self.rW, int(img.shape[0] * s))), cv2.COLOR_BGR2RGB)
+        self.rtk = ImageTk.PhotoImage(Image.fromarray(disp))
+        self.rcanvas.config(height=disp.shape[0])
+        self.rcanvas.delete("all")
+        self.rcanvas.create_image(0, 0, anchor=tk.NW, image=self.rtk)
+
+    def sync_other_eye(self):
+        """3D rigid-arc stereo constraint: fit both eyes' needle masks -> consistent
+        keypoints in BOTH views; write x,y (left) and x_right,y_right (right) into
+        the same sidecar. Prompts (never crashes) when inputs are missing."""
+        if process_frame is None or self.calib is None:
+            self.status.config(text="Sync: stereo unavailable (need calib + skimage/scipy).")
+            return
+        if getattr(self, "sess", None) is None:
+            return
+        cm = self.sess.class_masks.get(self.cur, {})
+        needleL = cm.get(args.needle_class)
+        threadL = cm.get(args.thread_class)
+        _, rmask = self._right_paths()
+        idxR = cv2.imread(rmask, cv2.IMREAD_GRAYSCALE) if (rmask and os.path.exists(rmask)) else None
+        needleR = (idxR == args.needle_class) if idxR is not None else None
+        if needleL is None or not needleL.any():
+            self.status.config(text="Sync: edit the needle (class 1) mask on this eye first.")
+            return
+        if needleR is None or not needleR.any():
+            self.status.config(text="Sync: right-eye needle mask missing (run infer with --save-masks).")
+            return
+        if threadL is None:
+            threadL = np.zeros_like(needleL)
+        try:
+            out, st = process_frame(needleL, needleR, threadL, self.calib, args.num_keypoints)
+        except Exception as e:
+            self.status.config(text=f"Sync failed: {e}")
+            return
+        if out is None:
+            self.status.config(text=f"Sync: no stereo fit ({st}).")
+            return
+        n = args.num_keypoints
+        names = ["tip"] + [f"k{i}" for i in range(1, n - 1)] + ["tail"]
+        kps = self.load_kps(self.cur)
+        kps[:] = []
+        for i in range(n):
+            xyz = out["xyz_mm"][i]
+            kps.append({"id": i, "name": names[i],
+                        "x": float(out["left"][i][0]), "y": float(out["left"][i][1]),
+                        "x_right": float(out["right"][i][0]), "y_right": float(out["right"][i][1]),
+                        "xyz_mm": ([float(v) for v in xyz] if xyz is not None else None),
+                        "visible": int(out["visible"][i])})
+        self.save_kps(self.cur)
+        self.status.config(text="Sync: both eyes updated from the 3D rigid-arc fit.")
+        self.render_right()
+        self.redraw()
+
+    # ----------------------------------------------------- needle centerline
+    @staticmethod
+    def _resample(poly, n):
+        """Equal-arc-length resample of an ordered polyline into n points."""
+        poly = np.asarray(poly, float)
+        seg = np.linalg.norm(np.diff(poly, axis=0), axis=1)
+        d = np.concatenate([[0.0], np.cumsum(seg)])
+        if d[-1] <= 1e-6:
+            return np.repeat(poly[:1], n, axis=0)
+        s = np.linspace(0.0, d[-1], n)
+        return np.stack([np.interp(s, d, poly[:, 0]), np.interp(s, d, poly[:, 1])], axis=1)
+
+    def _kps_from_centerline(self, idx, poly):
+        """Overwrite this frame's keypoints with n points sampled tip..tail along
+        the centerline, and persist them. (mask -> centerline -> keypoints.)"""
+        n = args.num_keypoints
+        names = ["tip"] + [f"k{i}" for i in range(1, n - 1)] + ["tail"]
+        samp = self._resample(poly, n)
+        if self.kp_flip.get(idx):
+            samp = samp[::-1]
+        kps = self.load_kps(idx)
+        kps[:] = [{"id": i, "name": names[i], "x": float(samp[i][0]),
+                   "y": float(samp[i][1]), "visible": 1} for i in range(n)]
+        self.save_kps(idx)
+
+    def _centerline_of(self, m):
+        """Extended (reaches tip/tail) centerline polyline of a needle mask, or None."""
+        if fit_arc_2d is None or m is None or not m.any():
+            return None
+        try:
+            poly = fit_arc_2d(m)
+            if poly is None:
+                poly = order_skeleton(m)
+        except Exception:
+            poly = None
+        if poly is not None and len(poly) >= 2:
+            poly = _extend_to_mask(np.asarray(poly, float), m)
+        return poly
+
+    def _needle_centerline(self, idx):
+        """Left-eye centerline (cached; recomputed only when the mask changes);
+        also auto-updates the keypoints sampled along it."""
+        cm = self.sess.class_masks.get(idx, {})
+        m = cm.get(args.needle_class)
+        if m is None or not m.any():
+            self.centerline.pop(idx, None)
+            return None
+        sig = int(m.sum())
+        cached = self.centerline.get(idx)
+        if cached and cached[0] == sig:
+            return cached[1]
+        poly = self._centerline_of(m)
+        self.centerline[idx] = (sig, poly)
+        if poly is not None and len(poly) >= 2:
+            self._kps_from_centerline(idx, poly)
+        return poly
+
+    def kp_swap_tip_tail(self):
+        """Flip tip<->tail for this frame (both eyes); persists across mask re-edits."""
+        if getattr(self, "sess", None) is None:
+            return
+        self.kp_flip[self.cur] = not self.kp_flip.get(self.cur, False)
+        kps = self.load_kps(self.cur)
+        if len(kps) >= 2:
+            kps.reverse()
+            n = len(kps)
+            names = ["tip"] + [f"k{i}" for i in range(1, n - 1)] + ["tail"]
+            for i, kp in enumerate(kps):
+                kp["name"], kp["id"] = names[i], i
+            self.save_kps(self.cur)
+        self.status.config(text="Tip/Tail flipped (both eyes).")
+        self.render_right()
+        self.redraw()
+
+    # ----------------------------------------------------- keypoints (Keypt mode)
+    def kp_sidecar(self, idx):
+        p = self.sess.frames[idx].replace("\\", "/")
+        p = p.replace("/images/", f"/{args.kp_subdir}/")
+        return Path(p).with_suffix(".json")
+
+    def load_kps(self, idx):
+        """Return (cached) list of needle keypoints for frame `idx`, loaded from
+        the sidecar. Edits to the returned list are persisted by save_kps()."""
+        if idx in self.kp_cache:
+            return self.kp_cache[idx]
+        path = self.kp_sidecar(idx)
+        full = None
+        if path.exists():
+            try:
+                full = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                full = None
+        if full is None:
+            rel = self.sess.frames[idx].replace("\\", "/")
+            i = rel.find("/images/")
+            rel = rel[i + 1:] if i >= 0 else os.path.basename(rel)
+            full = {"image": rel, "needle": {"keypoints": []}, "instruments": []}
+        nd = full.get("needle")
+        if nd is None:
+            nd = {"keypoints": []}
+            full["needle"] = nd
+        kps = nd.setdefault("keypoints", [])
+        self.kp_full[idx] = full
+        self.kp_cache[idx] = kps
+        return kps
+
+    def save_kps(self, idx):
+        full = self.kp_full.get(idx)
+        if full is None:
+            return
+        if full.get("needle") is not None:
+            full["needle"]["keypoints"] = self.kp_cache.get(idx, [])
+        path = self.kp_sidecar(idx)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(full, indent=2), encoding="utf-8")
+
+    def _kp_pick(self, x, y, kps, thr=12):
+        best, bd = None, float(thr) ** 2
+        for j, kp in enumerate(kps):
+            if kp.get("x") is None:
+                continue
+            d = (kp["x"] - x) ** 2 + (kp["y"] - y) ** 2
+            if d <= bd:
+                bd, best = d, j
+        return best
+
+    def _kp_down(self, e, label):
+        x, y = self.to_native(e.x, e.y)
+        kps = self.load_kps(self.cur)
+        if label == 0:                          # right-click = delete nearest
+            j = self._kp_pick(x, y, kps)
+            if j is not None:
+                kps.pop(j)
+                self.kp_sel = None
+                self.save_kps(self.cur)
+                self.redraw()
+            return
+        if self.kp_add:                         # add a new keypoint
+            kps.append({"id": len(kps), "name": f"kp{len(kps)}",
+                        "x": float(x), "y": float(y), "visible": 1})
+            self.kp_sel = len(kps) - 1
+            self.kp_add = False
+            self.save_kps(self.cur)
+            self.redraw()
+            return
+        self.kp_sel = self._kp_pick(x, y, kps)  # select for move (drag)
+        self.redraw()
+
+    def kp_add_toggle(self):
+        self.kp_add = not self.kp_add
+        if self.kp_add and self.mode != "keypt":
+            self.mode_var.set("keypt")
+            self.mode = "keypt"
+        self.redraw()
+
+    def kp_delete_sel(self):
+        if getattr(self, "sess", None) is None:
+            return
+        kps = self.load_kps(self.cur)
+        if self.kp_sel is not None and 0 <= self.kp_sel < len(kps):
+            kps.pop(self.kp_sel)
+            self.kp_sel = None
+            self.save_kps(self.cur)
+            self.redraw()
+        else:
+            self.status.config(text="Keypt: no keypoint selected — left-click a dot first, or 'Add KP (a)'.")
+
+    # ----------------------------------------------------- events: actions
+    def clear_class(self):
+        if self.propagating:
+            return
+        self.sess.clear_frame_obj(self.cur, self.active_cls)
+        self.redraw()
+
+    def clear_frame(self):
+        if self.propagating:
+            return
+        self.sess.clear_frame(self.cur)
+        self.redraw()
+
+    def reset_all(self):
+        if self.propagating:
+            return
+        self.sess.predictor.reset_state(self.sess.state)
+        self.sess.pm = PointManager()
+        self.sess.class_masks.clear()
+        self.redraw()
+
+    # ----------------------------------------------------- propagation
+    def toggle_propagate(self):
+        if self.propagating:
+            self.pause()
+        else:
+            self.start()
+
+    def start(self):
+        # Anchor on the current frame's saved/loaded annotation so we can
+        # propagate from previously-saved labels (e.g. a part reopened with only
+        # preloaded prediction PNGs, which are NOT yet SAM inputs).
+        self.sess.seed_from_mask(self.cur)
+        # Drop any SAM object that has no input on any frame; a dangling object
+        # (e.g. a class whose only prompt got cleared on an edit) otherwise makes
+        # propagate's preflight crash with "No input points or masks for object id N".
+        self.sess.prune_dangling_objects()
+        if not self.sess.has_inputs():
+            self.status.config(
+                text="Nothing to propagate: brush/paint on this frame (or open one "
+                     "with a saved mask) so a class is seeded, then press Propagate.")
+            return
+        # (re)build generator from current frame so latest edits are honored
+        self.gen = self.sess.make_propagator(self.cur)
+        self.propagating = True
+        self.prop_btn.config(text="Pause ⏸")
+        self._tick()
+
+    def use_saved_mask(self):
+        """Seed SAM with the current frame's saved/loaded mask as an anchor."""
+        if self.propagating:
+            return
+        n = self.sess.seed_from_mask(self.cur)
+        self.status.config(
+            text=(f"Seeded {n} class(es) from saved mask on frame {self.cur+1} "
+                  f"- now press Propagate ▶" if n else
+                  f"No saved mask on frame {self.cur+1} to seed from."))
+        self.redraw()
+
+    def pause(self):
+        self.propagating = False
+        self.gen = None                 # resume rebuilds from current frame
+        self.prop_btn.config(text="Propagate ▶")
+        self._set_status()
+
+    def _tick(self):
+        if not self.propagating or self.gen is None:
+            return
+        try:
+            fidx, _ = next(self.gen)
+        except StopIteration:
+            self.propagating = False
+            self.gen = None
+            self.prop_btn.config(text="Propagate ▶")
+            self.redraw()
+            return
+        self.cur = fidx
+        self.slider.set(fidx)
+        self.redraw()
+        self.root.after(1, self._tick)
+
+
+root = tk.Tk()
+app = AnnotatorGUI(root)
+root.mainloop()

@@ -294,6 +294,41 @@ def fit_circle_3d(X):
     return center, u, v, r
 
 
+def fit_circle_3d_fixed_r(X, radius):
+    """Model-based 3D->3D registration: align a planar circular arc of KNOWN
+    radius to the triangulated points X. Returns (center, u, v, radius).
+
+    Why this exists: the free fit_circle_3d re-estimates the radius every frame
+    from possibly occluded / asymmetric data, so under heavy occlusion the radius
+    (and hence the plane/centre) can swing wildly or degenerate when the visible
+    arc is nearly collinear. Surgical needles are standardized circular arcs of a
+    KNOWN radius, so we fix the radius and only solve the in-plane centre — a far
+    better-conditioned 2-DoF problem that stays stable on short / partial arcs.
+    The plane is still estimated from the data (SVD), the radius is the model
+    prior; see docs/NEEDLE_POSE_REGISTRATION.md (step a)."""
+    X = np.asarray(X, float)
+    c0 = X.mean(0)
+    _, _, Vt = np.linalg.svd(X - c0)
+    u, v = Vt[0], Vt[1]                  # in-plane basis (plane from data)
+    a = (X - c0) @ u; b = (X - c0) @ v
+    # initial centre from the free algebraic fit (good warm start)
+    A = np.stack([a, b, np.ones_like(a)], 1)
+    sol, *_ = np.linalg.lstsq(A, -(a**2 + b**2), rcond=None)
+    uc0, vc0 = -sol[0] / 2, -sol[1] / 2
+    uc, vc = float(uc0), float(vc0)
+    if _HAVE_SCIPY:
+        # refine ONLY the centre with the radius held at the model value
+        def resid(p):
+            return np.hypot(a - p[0], b - p[1]) - radius
+        try:
+            s = least_squares(resid, [uc0, vc0], method="lm", max_nfev=50)
+            uc, vc = float(s.x[0]), float(s.x[1])
+        except Exception:
+            pass
+    center = c0 + uc * u + vc * v
+    return center, u, v, float(radius)
+
+
 def pose_from_arc(X3, center, normal):
     """6-DoF pose of the rigid needle in the camera (cam1) frame, from the fitted
     arc: origin = arc center; z = plane normal; x = in-plane direction to the tip;
@@ -358,7 +393,8 @@ def extend_to_mask(poly, mask, max_steps=400):
     return np.vstack([walk(poly[1], poly[0]), poly, walk(poly[-2], poly[-1])])
 
 
-def process_frame(maskL, maskR, threadL, calib, n_kp, n_fit=40, arc_fit=True):
+def process_frame(maskL, maskR, threadL, calib, n_kp, n_fit=40, arc_fit=True,
+                  model_radius=None):
     # Reconstruct the COMPLETE needle from (possibly multiple) occluded segments
     # via a robust ellipse-arc fit; fall back to longest-path skeleton.
     polyL = fit_arc_2d(maskL) if arc_fit else None
@@ -413,10 +449,15 @@ def process_frame(maskL, maskR, threadL, calib, n_kp, n_fit=40, arc_fit=True):
     uKL = undistort_poly(kpL, calib["K1"], calib["D1"])
     uKR = undistort_poly(kpR, calib["K2"], calib["D2"])
     X3 = triangulate(calib["P1"], calib["P2"], uKL, uKR)
+    radius_fixed = bool(model_radius and model_radius > 0)
     try:
-        center, u, v, r = fit_circle_3d(X3)
+        if radius_fixed:
+            center, u, v, r = fit_circle_3d_fixed_r(X3, float(model_radius))
+        else:
+            center, u, v, r = fit_circle_3d(X3)
     except Exception:
         center, u, v, r = np.zeros(3), np.array([1., 0, 0]), np.array([0, 1., 0]), 0.0
+        radius_fixed = False
 
     # visibility: is the keypoint inside the ACTUAL needle mask (not a filled gap)?
     def inside(mask, xy, rad=4):
@@ -448,7 +489,8 @@ def process_frame(maskL, maskR, threadL, calib, n_kp, n_fit=40, arc_fit=True):
     return dict(
         xyz_mm=X3.tolist(), left=kpL.tolist(), right=kpR.tolist(),
         visible=visible.tolist(), tip_tail_known=bool(tip_tail_known),
-        circle=dict(center=center.tolist(), normal=normal.tolist(), radius_mm=float(r)),
+        circle=dict(center=center.tolist(), normal=normal.tolist(), radius_mm=float(r),
+                    radius_fixed=radius_fixed),
         pose=dict(R=R6.tolist(), t=t6.tolist(), rvec=rvec6.tolist()),
         conf=conf,
         polyL=polyL.tolist(), polyR=polyR.tolist(),   # reconstructed arcs (diag)
@@ -545,7 +587,15 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="process only first N frames (0=all)")
     ap.add_argument("--no-arc-fit", action="store_true",
                     help="disable multi-segment ellipse-arc reconstruction (use longest-path skeleton)")
+    ap.add_argument("--model-radius", type=float, default=None,
+                    help="known needle arc radius (mm); enables fixed-radius 3D registration "
+                         "(model-based pose). Omit for the legacy free-radius circle fit.")
+    ap.add_argument("--needle-model", type=Path, default=None,
+                    help="needle_model.json with {'radius_mm': ...}; overrides --model-radius")
     args = ap.parse_args()
+    if args.needle_model and args.needle_model.is_file():
+        args.model_radius = float(json.loads(
+            args.needle_model.read_text(encoding="utf-8"))["radius_mm"])
 
     from PIL import Image
     root = args.root.resolve()
@@ -578,7 +628,8 @@ def main():
             continue
         try:
             out, status = process_frame(needleL, needleR, threadL, calib,
-                                        args.num_keypoints, arc_fit=not args.no_arc_fit)
+                                        args.num_keypoints, arc_fit=not args.no_arc_fit,
+                                        model_radius=args.model_radius)
         except Exception as e:  # noqa
             out, status = None, f"error:{e}"
         if out is None:
